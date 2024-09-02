@@ -2982,11 +2982,6 @@ static void prvInitialiseNewTask( TaskFunction_t pxTaskCode,
     {
         TCB_t * pxTCB;
         BaseType_t xCoreID;
-        UBaseType_t uxPrevCoreAffinityMask;
-
-        #if ( configUSE_PREEMPTION == 1 )
-            UBaseType_t uxPrevNotAllowedCores;
-        #endif
 
         traceENTER_vTaskCoreAffinitySet( xTask, uxCoreAffinityMask );
 
@@ -2994,7 +2989,6 @@ static void prvInitialiseNewTask( TaskFunction_t pxTaskCode,
         {
             pxTCB = prvGetTCBFromHandle( xTask );
 
-            uxPrevCoreAffinityMask = pxTCB->uxCoreAffinityMask;
             pxTCB->uxCoreAffinityMask = uxCoreAffinityMask;
 
             if( xSchedulerRunning != pdFALSE )
@@ -3014,17 +3008,14 @@ static void prvInitialiseNewTask( TaskFunction_t pxTaskCode,
                 {
                     #if ( configUSE_PREEMPTION == 1 )
                     {
-                        /* Calculate the cores on which this task was not allowed to
-                         * run previously. */
-                        uxPrevNotAllowedCores = ( ~uxPrevCoreAffinityMask ) & ( ( 1U << configNUMBER_OF_CORES ) - 1U );
-
-                        /* Does the new core mask enables this task to run on any of the
-                         * previously not allowed cores? If yes, check if this task can be
-                         * scheduled on any of those cores. */
-                        if( ( uxPrevNotAllowedCores & uxCoreAffinityMask ) != 0U )
-                        {
-                            prvYieldForTask( pxTCB );
-                        }
+                        /* The SMP scheduler requests a core to yield when a ready
+                         * task is able to run. It is possible that the core affinity
+                         * of the ready task is changed before the requested core
+                         * can select it to run. In that case, the task may not be
+                         * selected by the previously requested core due to core affinity
+                         * constraint and the SMP scheduler must select a new core to
+                         * yield for the task. */
+                        prvYieldForTask( xTask );
                     }
                     #else /* #if( configUSE_PREEMPTION == 1 ) */
                     {
@@ -3819,9 +3810,30 @@ void vTaskSuspendAll( void )
     #if ( configNUMBER_OF_CORES == 1 )
     {
         /* A critical section is not required as the variable is of type
-         * BaseType_t.  Please read Richard Barry's reply in the following link to a
-         * post in the FreeRTOS support forum before reporting this as a bug! -
-         * https://goo.gl/wu4acr */
+         * BaseType_t. Each task maintains its own context, and a context switch
+         * cannot occur if the variable is non zero. So, as long as the writing
+         * from the register back into the memory is atomic, it is not a
+         * problem.
+         *
+         * Consider the following scenario, which starts with
+         * uxSchedulerSuspended at zero.
+         *
+         * 1. load uxSchedulerSuspended into register.
+         * 2. Now a context switch causes another task to run, and the other
+         *    task uses the same variable. The other task will see the variable
+         *    as zero because the variable has not yet been updated by the
+         *    original task. Eventually the original task runs again. **That can
+         *    only happen when uxSchedulerSuspended is once again zero**. When
+         *    the original task runs again, the contents of the CPU registers
+         *    are restored to exactly how they were when it was switched out -
+         *    therefore the value it read into the register still matches the
+         *    value of the uxSchedulerSuspended variable.
+         *
+         * 3. increment register.
+         * 4. store register into uxSchedulerSuspended. The value restored to
+         *    uxSchedulerSuspended will be the correct value of 1, even though
+         *    the variable was used by other tasks in the mean time.
+         */
 
         /* portSOFTWARE_BARRIER() is only implemented for emulated/simulated ports that
          * do not otherwise exhibit real time behaviour. */
@@ -4677,10 +4689,6 @@ BaseType_t xTaskIncrementTick( void )
     TickType_t xItemValue;
     BaseType_t xSwitchRequired = pdFALSE;
 
-    #if ( configUSE_PREEMPTION == 1 ) && ( configNUMBER_OF_CORES > 1 )
-    BaseType_t xYieldRequiredForCore[ configNUMBER_OF_CORES ] = { pdFALSE };
-    #endif /* #if ( configUSE_PREEMPTION == 1 ) && ( configNUMBER_OF_CORES > 1 ) */
-
     traceENTER_xTaskIncrementTick();
 
     /* Called by the portable layer each time a tick interrupt occurs.
@@ -4832,7 +4840,7 @@ BaseType_t xTaskIncrementTick( void )
                 {
                     if( listCURRENT_LIST_LENGTH( &( pxReadyTasksLists[ pxCurrentTCBs[ xCoreID ]->uxPriority ] ) ) > 1U )
                     {
-                        xYieldRequiredForCore[ xCoreID ] = pdTRUE;
+                        xYieldPendings[ xCoreID ] = pdTRUE;
                     }
                     else
                     {
@@ -4884,7 +4892,7 @@ BaseType_t xTaskIncrementTick( void )
                         if( pxCurrentTCBs[ xCoreID ]->xPreemptionDisable == pdFALSE )
                     #endif
                     {
-                        if( ( xYieldRequiredForCore[ xCoreID ] != pdFALSE ) || ( xYieldPendings[ xCoreID ] != pdFALSE ) )
+                        if( xYieldPendings[ xCoreID ] != pdFALSE )
                         {
                             if( xCoreID == xCurrentCoreID )
                             {
@@ -8059,6 +8067,22 @@ TickType_t uxTaskResetEventItemValue( void )
                 {
                     listREMOVE_ITEM( &( pxTCB->xStateListItem ) );
                     prvAddTaskToReadyList( pxTCB );
+
+                    #if ( configUSE_TICKLESS_IDLE != 0 )
+                    {
+                        /* If a task is blocked waiting for a notification then
+                         * xNextTaskUnblockTime might be set to the blocked task's time
+                         * out time.  If the task is unblocked for a reason other than
+                         * a timeout xNextTaskUnblockTime is normally left unchanged,
+                         * because it will automatically get reset to a new value when
+                         * the tick count equals xNextTaskUnblockTime.  However if
+                         * tickless idling is used it might be more important to enter
+                         * sleep mode at the earliest possible time - so reset
+                         * xNextTaskUnblockTime here to ensure it is updated at the
+                         * earliest possible time. */
+                        prvResetNextTaskUnblockTime();
+                    }
+                    #endif
                 }
                 else
                 {
@@ -8177,6 +8201,22 @@ TickType_t uxTaskResetEventItemValue( void )
                 {
                     listREMOVE_ITEM( &( pxTCB->xStateListItem ) );
                     prvAddTaskToReadyList( pxTCB );
+
+                    #if ( configUSE_TICKLESS_IDLE != 0 )
+                    {
+                        /* If a task is blocked waiting for a notification then
+                         * xNextTaskUnblockTime might be set to the blocked task's time
+                         * out time.  If the task is unblocked for a reason other than
+                         * a timeout xNextTaskUnblockTime is normally left unchanged,
+                         * because it will automatically get reset to a new value when
+                         * the tick count equals xNextTaskUnblockTime.  However if
+                         * tickless idling is used it might be more important to enter
+                         * sleep mode at the earliest possible time - so reset
+                         * xNextTaskUnblockTime here to ensure it is updated at the
+                         * earliest possible time. */
+                        prvResetNextTaskUnblockTime();
+                    }
+                    #endif
                 }
                 else
                 {
@@ -8617,7 +8657,7 @@ static void prvAddCurrentTaskToDelayedList( TickType_t xTicksToWait,
 #endif /* #if ( ( configSUPPORT_STATIC_ALLOCATION == 1 ) && ( configKERNEL_PROVIDED_STATIC_MEMORY == 1 ) && ( portUSING_MPU_WRAPPERS == 0 ) ) */
 /*-----------------------------------------------------------*/
 
-#if ( ( configSUPPORT_STATIC_ALLOCATION == 1 ) && ( configKERNEL_PROVIDED_STATIC_MEMORY == 1 ) && ( portUSING_MPU_WRAPPERS == 0 ) )
+#if ( ( configSUPPORT_STATIC_ALLOCATION == 1 ) && ( configKERNEL_PROVIDED_STATIC_MEMORY == 1 ) && ( portUSING_MPU_WRAPPERS == 0 ) && ( configUSE_TIMERS == 1 ) )
 
 /*
  * This is the kernel provided implementation of vApplicationGetTimerTaskMemory()
@@ -8638,7 +8678,7 @@ static void prvAddCurrentTaskToDelayedList( TickType_t xTicksToWait,
         *puxTimerTaskStackSize = configTIMER_TASK_STACK_DEPTH;
     }
 
-#endif /* #if ( ( configSUPPORT_STATIC_ALLOCATION == 1 ) && ( configKERNEL_PROVIDED_STATIC_MEMORY == 1 ) && ( portUSING_MPU_WRAPPERS == 0 ) ) */
+#endif /* #if ( ( configSUPPORT_STATIC_ALLOCATION == 1 ) && ( configKERNEL_PROVIDED_STATIC_MEMORY == 1 ) && ( portUSING_MPU_WRAPPERS == 0 ) && ( configUSE_TIMERS == 1 ) ) */
 /*-----------------------------------------------------------*/
 
 /*

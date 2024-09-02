@@ -20,6 +20,9 @@ After completing these steps, you can create or modify a *Raspberry Pi Pico Proj
 - *JTAG/SWD programmer*: CMSIS-DAP
 - *Debugged device*: target/rp2350.cfg
 
+## FreeRTOS Port Update
+I was unaware of the Raspberry Pi team's [FreeRTOS-Kernel](https://github.com/raspberrypi/FreeRTOS-Kernel) fork before I started this project. I've updated the project to use the RPI fork, so you can now use this repo as an example.
+
 ## FreeRTOS Port
 The RP2350 uses two processor architectures: M0PLUS and M33. I can cover the M33 architecture. Although I'm not entirely sure, I believe the RP2040 and RP2350 ports are similar, except for one key difference: the spin wait implementation.  
 

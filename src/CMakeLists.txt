@@ -5,7 +5,7 @@ set(FREERTOS_KERNEL_PATH ${SRC}/FreeRTOS)
 
 pico_sdk_init()
 
-add_subdirectory(${FREERTOS_KERNEL_PATH}/portable/ThirdParty/GCC/RP2040 FREERTOS_KERNEL)
+add_subdirectory(${FREERTOS_KERNEL_PATH}/portable/ThirdParty/GCC/RP2350_ARM_NTZ FREERTOS_KERNEL)
 
 add_executable(${TARGET_NAME} 
     ${SRC}/hello_freertos.c 
